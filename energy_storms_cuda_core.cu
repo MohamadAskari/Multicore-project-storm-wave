@@ -6,33 +6,46 @@
 
 #define BLOCK_SIZE 256
 
-/* CUDA kernel to update energy for all cells based on one particle impact with sqrt table */
-__global__ void update_energy_kernel(float *layer, int layer_size, int position, float base, float thresh) {
+__global__ void bombardment_kernel(float *layer, int layer_size, int storm_size, int *storm_posval) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
-    
+
     if (k < layer_size) {
-        /* 1. Compute the absolute value of the distance */
-        int distance = position - k;
-        if (distance < 0) distance = -distance;
-        
-        /* 2. Impact cell has a distance value of 1 */
-        distance = distance + 1;
-        
-        /* 3. Square root of the distance - use precomputed table */
-        // float atenuacion = sqrt_table[distance];
-        float atenuacion = sqrtf(distance);
-        
-        /* 4. Compute attenuated energy */
-        float energy_k = base / atenuacion;
-        
-        /* 5. Do not add if its absolute value is lower than the threshold */
-        if (energy_k >= thresh || energy_k <= -thresh)
-            // atomicAdd(&layer[k], energy_k);
-            layer[k] += energy_k;
+        float cell_value = layer[k];
+
+        /* For each particle */
+        for (int j = 0; j < storm_size; j++) {
+            /* Get impact energy (expressed in thousandths) */
+            float energy = (float)storm_posval[j * 2 + 1] * 1000.0f;
+            /* Get impact position */
+            int position = storm_posval[j * 2];
+
+            float base = energy / (float)layer_size;
+            float thresh = THRESHOLD / (float)layer_size;
+
+            /* 1. Compute the absolute value of the distance between the
+            impact position and the k-th position of the layer */            int distance = position - k;
+            if (distance < 0) distance = -distance;
+
+            /* 2. Impact cell has a distance value of 1 */
+            distance = distance + 1;
+
+            /* 3. Square root of the distance */
+            /* NOTE: Real world atenuation typically depends on the square of the distance.
+            We use here a tailored equation that affects a much wider range of cells */
+            float atenuacion = sqrtf((float)distance);
+
+            /* 4. Compute attenuated energy */
+            float energy_k = base / atenuacion;
+
+            /* 5. Do not add if its absolute value is lower than the threshold */
+            if (energy_k >= thresh || energy_k <= -thresh)
+                cell_value += energy_k;
+        }
+
+        layer[k] = cell_value;
     }
 }
 
-/* CUDA kernel for relaxation stencil */
 __global__ void relaxation_kernel(float *layer, float *layer_copy, int layer_size) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -41,12 +54,11 @@ __global__ void relaxation_kernel(float *layer, float *layer_copy, int layer_siz
     }
 }
 
-/* CUDA kernel to find local maxima */
 __global__ void find_local_maxima_kernel(float *layer, int layer_size, float *max_values, int *max_positions, int num_candidates) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
     if (idx < num_candidates) {
-        int k = idx + 1;  // Start from position 1
+        int k = idx + 1;
         if (k < layer_size - 1) {
             if (layer[k] > layer[k-1] && layer[k] > layer[k+1]) {
                 max_values[idx] = layer[k];
@@ -59,12 +71,10 @@ __global__ void find_local_maxima_kernel(float *layer, int layer_size, float *ma
     }
 }
 
-/* CUDA kernel for parallel reduction - each thread compares two elements */
 __global__ void reduce_max_kernel(float *values, int *positions, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = (n + 1) / 2;  // First half size (rounded up)
+    int stride = (n + 1) / 2;
     
-    // Thread idx compares element[idx] with element[idx + stride]
     if (idx < stride && (idx + stride) < n) {
         if (values[idx + stride] > values[idx]) {
             values[idx] = values[idx + stride];
@@ -74,47 +84,31 @@ __global__ void reduce_max_kernel(float *values, int *positions, int n) {
 }
 
 void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *positions) {
-    int i, j;
-    
-    // /* Find maximum distance for sqrt table */
-    // int max_distance = layer_size;
-    // for (i = 0; i < num_storms; i++) {
-    //     for (j = 0; j < storms[i].size; j++) {
-    //         int pos = storms[i].posval[j * 2];
-    //         if (pos + 1 > max_distance) max_distance = pos + 1;
-    //     }
-    // }
-    
-    // /* Precompute sqrt table on host */
-    // float *h_sqrt_table = (float*)malloc(sizeof(float) * (max_distance + 1));
-    // h_sqrt_table[0] = 1.0f;  // Avoid division by zero
-    // for (int d = 1; d <= max_distance; d++) {
-    //     h_sqrt_table[d] = sqrtf((float)d);
-    // }
-    
-    // /* Allocate device memory for sqrt table and copy */
-    // float *d_sqrt_table;
-    // cudaMalloc((void**)&d_sqrt_table, sizeof(float) * (max_distance + 1));
-    // cudaMemcpy(d_sqrt_table, h_sqrt_table, sizeof(float) * (max_distance + 1), cudaMemcpyHostToDevice);
-    
-    /* Allocate device memory for layers */
+    int i;
+   
     float *d_layer, *d_layer_copy;
     cudaMalloc((void**)&d_layer, sizeof(float) * layer_size);
     cudaMalloc((void**)&d_layer_copy, sizeof(float) * layer_size);
     
-    /* Initialize device layer to zero */
     cudaMemset(d_layer, 0, sizeof(float) * layer_size);
     cudaMemset(d_layer_copy, 0, sizeof(float) * layer_size);
     
-    /* Allocate memory for reduction results (only device memory needed now) */
-    int num_candidates = layer_size - 2;  // Exclude first and last positions
+    int num_candidates = layer_size - 2;  
     float *d_max_values;
     int *d_max_positions;
-    
+
     cudaMalloc((void**)&d_max_values, sizeof(float) * num_candidates);
     cudaMalloc((void**)&d_max_positions, sizeof(int) * num_candidates);
+
+    int **d_storm_posval = (int**)malloc(sizeof(int*) * num_storms);
+    int *storm_sizes = (int*)malloc(sizeof(int) * num_storms);
+
+    for (i = 0; i < num_storms; i++) {
+        storm_sizes[i] = storms[i].size;
+        cudaMalloc((void**)&d_storm_posval[i], sizeof(int) * storms[i].size * 2);
+        cudaMemcpy(d_storm_posval[i], storms[i].posval, sizeof(int) * storms[i].size * 2, cudaMemcpyHostToDevice);
+    }
     
-    /* Calculate grid dimensions */
     int numBlocks = (layer_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
     int numBlocksReduction = (num_candidates + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
@@ -122,21 +116,8 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
     for (i = 0; i < num_storms; i++) {
         
         /* 4.1. Add impacts energies to layer cells */
-        for (j = 0; j < storms[i].size; j++) {
-            /* Get impact energy (expressed in thousandths) */
-            float energy = (float)storms[i].posval[j*2+1] * 1000.0f;
-            /* Get impact position */
-            int position = storms[i].posval[j*2];
-            
-            /* Precompute constants */
-            float base = energy / (float)layer_size;
-            float thresh = THRESHOLD / (float)layer_size;
-            
-            /* Launch kernel to update all cells for this particle */
-            update_energy_kernel<<<numBlocks, BLOCK_SIZE>>>(d_layer, layer_size, position, base, thresh);
-        }
+        bombardment_kernel<<<numBlocks, BLOCK_SIZE>>>(d_layer, layer_size, storm_sizes[i], d_storm_posval[i]);
         
-        /* Synchronize after all particles in the storm */
         cudaDeviceSynchronize();
         
         /* 4.2. Energy relaxation between storms */
@@ -148,31 +129,36 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
         cudaDeviceSynchronize();
         
         /* 4.3. Locate the maximum value in the layer */
-        /* Step 1: Find all local maxima (eliminates non-peaks) */
         find_local_maxima_kernel<<<numBlocksReduction, BLOCK_SIZE>>>(d_layer, layer_size, d_max_values, d_max_positions, num_candidates);
         
-        /* Step 2: Parallel reduction on GPU - repeatedly halve until 1 remains */
+        struct timeval t_start, t_end;
+        gettimeofday(&t_start, NULL);
+
         int remaining = num_candidates;
         while (remaining > 1) {
-            int half = (remaining + 1) / 2;  // Number of comparisons needed
+            int half = (remaining + 1) / 2; 
             int reductionBlocks = (half + BLOCK_SIZE - 1) / BLOCK_SIZE;
             reduce_max_kernel<<<reductionBlocks, BLOCK_SIZE>>>(d_max_values, d_max_positions, remaining);
             cudaDeviceSynchronize();
-            remaining = half;  // Winners are now in the first half
+            remaining = half;
         }
         
-        /* Step 3: Copy only the single winner back to host */
         cudaMemcpy(&maximum[i], d_max_values, sizeof(float), cudaMemcpyDeviceToHost);
         cudaMemcpy(&positions[i], d_max_positions, sizeof(int), cudaMemcpyDeviceToHost);
+        gettimeofday(&t_end, NULL);
+        double elapsed = (t_end.tv_sec - t_start.tv_sec) * 1000.0 + (t_end.tv_usec - t_start.tv_usec) / 1000.0;
+        printf("[Timing] memcpy: %.3f ms\n", elapsed);
     }
     
-    /* Free device memory */
     cudaFree(d_layer);
     cudaFree(d_layer_copy);
     cudaFree(d_max_values);
     cudaFree(d_max_positions);
-    // cudaFree(d_sqrt_table);
-    
-    // /* Free host memory */
-    // free(h_sqrt_table);
+
+    for (i = 0; i < num_storms; i++) {
+        cudaFree(d_storm_posval[i]);
+    }
+    free(d_storm_posval);
+    free(storm_sizes);
+
 }
