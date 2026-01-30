@@ -26,7 +26,8 @@ __global__ void update_energy_kernel(float *layer, int layer_size, int position,
         
         /* 5. Do not add if its absolute value is lower than the threshold */
         if (energy_k >= thresh || energy_k <= -thresh)
-            atomicAdd(&layer[k], energy_k);
+            // atomicAdd(&layer[k], energy_k);
+            layer[k] += energy_k;
     }
 }
 
@@ -57,20 +58,18 @@ __global__ void find_local_maxima_kernel(float *layer, int layer_size, float *ma
     }
 }
 
-/* Optimized reduction to find maximum on CPU from candidates */
-void find_global_maximum(float *max_values, int *max_positions, int num_candidates, float *maximum, int *position) {
-    float max_val = -1.0f;
-    int max_pos = -1;
+/* CUDA kernel for parallel reduction - each thread compares two elements */
+__global__ void reduce_max_kernel(float *values, int *positions, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = (n + 1) / 2;  // First half size (rounded up)
     
-    for (int i = 0; i < num_candidates; i++) {
-        if (max_values[i] > max_val) {
-            max_val = max_values[i];
-            max_pos = max_positions[i];
+    // Thread idx compares element[idx] with element[idx + stride]
+    if (idx < stride && (idx + stride) < n) {
+        if (values[idx + stride] > values[idx]) {
+            values[idx] = values[idx + stride];
+            positions[idx] = positions[idx + stride];
         }
     }
-    
-    *maximum = max_val;
-    *position = max_pos;
 }
 
 void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *positions) {
@@ -106,15 +105,13 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
     cudaMemset(d_layer, 0, sizeof(float) * layer_size);
     cudaMemset(d_layer_copy, 0, sizeof(float) * layer_size);
     
-    /* Allocate memory for reduction results */
+    /* Allocate memory for reduction results (only device memory needed now) */
     int num_candidates = layer_size - 2;  // Exclude first and last positions
-    float *d_max_values, *h_max_values;
-    int *d_max_positions, *h_max_positions;
+    float *d_max_values;
+    int *d_max_positions;
     
     cudaMalloc((void**)&d_max_values, sizeof(float) * num_candidates);
     cudaMalloc((void**)&d_max_positions, sizeof(int) * num_candidates);
-    h_max_values = (float*)malloc(sizeof(float) * num_candidates);
-    h_max_positions = (int*)malloc(sizeof(int) * num_candidates);
     
     /* Calculate grid dimensions */
     int numBlocks = (layer_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -150,15 +147,22 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
         cudaDeviceSynchronize();
         
         /* 4.3. Locate the maximum value in the layer */
-        /* Find all local maxima */
+        /* Step 1: Find all local maxima (eliminates non-peaks) */
         find_local_maxima_kernel<<<numBlocksReduction, BLOCK_SIZE>>>(d_layer, layer_size, d_max_values, d_max_positions, num_candidates);
         
-        /* Copy candidates to host */
-        cudaMemcpy(h_max_values, d_max_values, sizeof(float) * num_candidates, cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_max_positions, d_max_positions, sizeof(int) * num_candidates, cudaMemcpyDeviceToHost);
+        /* Step 2: Parallel reduction on GPU - repeatedly halve until 1 remains */
+        int remaining = num_candidates;
+        while (remaining > 1) {
+            int half = (remaining + 1) / 2;  // Number of comparisons needed
+            int reductionBlocks = (half + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            reduce_max_kernel<<<reductionBlocks, BLOCK_SIZE>>>(d_max_values, d_max_positions, remaining);
+            cudaDeviceSynchronize();
+            remaining = half;  // Winners are now in the first half
+        }
         
-        /* Find global maximum on CPU */
-        find_global_maximum(h_max_values, h_max_positions, num_candidates, &maximum[i], &positions[i]);
+        /* Step 3: Copy only the single winner back to host */
+        cudaMemcpy(&maximum[i], d_max_values, sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&positions[i], d_max_positions, sizeof(int), cudaMemcpyDeviceToHost);
     }
     
     /* Free device memory */
@@ -169,7 +173,5 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
     cudaFree(d_sqrt_table);
     
     /* Free host memory */
-    free(h_max_values);
-    free(h_max_positions);
     free(h_sqrt_table);
 }
