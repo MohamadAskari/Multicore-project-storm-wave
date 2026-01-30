@@ -7,7 +7,7 @@
 #define BLOCK_SIZE 256
 
 /* CUDA kernel to update energy for all cells based on one particle impact with sqrt table */
-__global__ void update_energy_kernel(float *layer, int layer_size, int position, float base, float thresh, float *sqrt_table) {
+__global__ void update_energy_kernel(float *layer, int layer_size, int position, float base, float thresh) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     
     if (k < layer_size) {
@@ -19,7 +19,8 @@ __global__ void update_energy_kernel(float *layer, int layer_size, int position,
         distance = distance + 1;
         
         /* 3. Square root of the distance - use precomputed table */
-        float atenuacion = sqrt_table[distance];
+        // float atenuacion = sqrt_table[distance];
+        float atenuacion = sqrtf(distance);
         
         /* 4. Compute attenuated energy */
         float energy_k = base / atenuacion;
@@ -75,26 +76,26 @@ __global__ void reduce_max_kernel(float *values, int *positions, int n) {
 void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *positions) {
     int i, j;
     
-    /* Find maximum distance for sqrt table */
-    int max_distance = layer_size;
-    for (i = 0; i < num_storms; i++) {
-        for (j = 0; j < storms[i].size; j++) {
-            int pos = storms[i].posval[j * 2];
-            if (pos + 1 > max_distance) max_distance = pos + 1;
-        }
-    }
+    // /* Find maximum distance for sqrt table */
+    // int max_distance = layer_size;
+    // for (i = 0; i < num_storms; i++) {
+    //     for (j = 0; j < storms[i].size; j++) {
+    //         int pos = storms[i].posval[j * 2];
+    //         if (pos + 1 > max_distance) max_distance = pos + 1;
+    //     }
+    // }
     
-    /* Precompute sqrt table on host */
-    float *h_sqrt_table = (float*)malloc(sizeof(float) * (max_distance + 1));
-    h_sqrt_table[0] = 1.0f;  // Avoid division by zero
-    for (int d = 1; d <= max_distance; d++) {
-        h_sqrt_table[d] = sqrtf((float)d);
-    }
+    // /* Precompute sqrt table on host */
+    // float *h_sqrt_table = (float*)malloc(sizeof(float) * (max_distance + 1));
+    // h_sqrt_table[0] = 1.0f;  // Avoid division by zero
+    // for (int d = 1; d <= max_distance; d++) {
+    //     h_sqrt_table[d] = sqrtf((float)d);
+    // }
     
-    /* Allocate device memory for sqrt table and copy */
-    float *d_sqrt_table;
-    cudaMalloc((void**)&d_sqrt_table, sizeof(float) * (max_distance + 1));
-    cudaMemcpy(d_sqrt_table, h_sqrt_table, sizeof(float) * (max_distance + 1), cudaMemcpyHostToDevice);
+    // /* Allocate device memory for sqrt table and copy */
+    // float *d_sqrt_table;
+    // cudaMalloc((void**)&d_sqrt_table, sizeof(float) * (max_distance + 1));
+    // cudaMemcpy(d_sqrt_table, h_sqrt_table, sizeof(float) * (max_distance + 1), cudaMemcpyHostToDevice);
     
     /* Allocate device memory for layers */
     float *d_layer, *d_layer_copy;
@@ -132,7 +133,7 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
             float thresh = THRESHOLD / (float)layer_size;
             
             /* Launch kernel to update all cells for this particle */
-            update_energy_kernel<<<numBlocks, BLOCK_SIZE>>>(d_layer, layer_size, position, base, thresh, d_sqrt_table);
+            update_energy_kernel<<<numBlocks, BLOCK_SIZE>>>(d_layer, layer_size, position, base, thresh);
         }
         
         /* Synchronize after all particles in the storm */
@@ -170,8 +171,8 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
     cudaFree(d_layer_copy);
     cudaFree(d_max_values);
     cudaFree(d_max_positions);
-    cudaFree(d_sqrt_table);
+    // cudaFree(d_sqrt_table);
     
-    /* Free host memory */
-    free(h_sqrt_table);
+    // /* Free host memory */
+    // free(h_sqrt_table);
 }
