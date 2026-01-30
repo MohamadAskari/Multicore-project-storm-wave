@@ -27,7 +27,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *positions);
+void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *positions, int block_size);
 
 /*
  * MAIN PROGRAM
@@ -58,12 +58,18 @@ int main(int argc, char *argv[]) {
     }
 
     /* 2. Begin time measurement */
+    int block_size = 256;
+    const char *block_env = getenv("CUDA_BLOCK_SIZE");
+    if (block_env && block_env[0] != '\0') {
+        int parsed = atoi(block_env);
+        if (parsed > 0) block_size = parsed;
+    }
     cudaSetDevice(0);
     cudaDeviceSynchronize();
     double ttotal = cp_Wtime();
 
     /* START: Do NOT optimize/parallelize the code of the main program above this point */
-    core(layer_size, num_storms, storms, maximum, positions);
+    core(layer_size, num_storms, storms, maximum, positions, block_size);
     /* END: Do NOT optimize/parallelize the code below this point */
 
     /* 5. End time measurement */

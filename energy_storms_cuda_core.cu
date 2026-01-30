@@ -4,8 +4,6 @@
 #include <cuda.h>
 #include "energy_storms.h"
 
-#define BLOCK_SIZE 256
-
 __global__ void bombardment_kernel(float *layer, int layer_size, int storm_size, int *storm_posval) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -83,7 +81,7 @@ __global__ void reduce_max_kernel(float *values, int *positions, int n) {
     }
 }
 
-void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *positions) {
+void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *positions, int block_size) {
     int i;
    
     float *d_layer, *d_layer_copy;
@@ -109,14 +107,14 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
         cudaMemcpy(d_storm_posval[i], storms[i].posval, sizeof(int) * storms[i].size * 2, cudaMemcpyHostToDevice);
     }
     
-    int numBlocks = (layer_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    int numBlocksReduction = (num_candidates + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int numBlocks = (layer_size + block_size - 1) / block_size;
+    int numBlocksReduction = (num_candidates + block_size - 1) / block_size;
     
     /* 4. Storms simulation */
     for (i = 0; i < num_storms; i++) {
         
         /* 4.1. Add impacts energies to layer cells */
-        bombardment_kernel<<<numBlocks, BLOCK_SIZE>>>(d_layer, layer_size, storm_sizes[i], d_storm_posval[i]);
+        bombardment_kernel<<<numBlocks, block_size>>>(d_layer, layer_size, storm_sizes[i], d_storm_posval[i]);
         
         cudaDeviceSynchronize();
         
@@ -125,11 +123,11 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
         cudaMemcpy(d_layer_copy, d_layer, sizeof(float) * layer_size, cudaMemcpyDeviceToDevice);
         
         /* 4.2.2. Apply relaxation stencil */
-        relaxation_kernel<<<numBlocks, BLOCK_SIZE>>>(d_layer, d_layer_copy, layer_size);
+        relaxation_kernel<<<numBlocks, block_size>>>(d_layer, d_layer_copy, layer_size);
         cudaDeviceSynchronize();
         
         /* 4.3. Locate the maximum value in the layer */
-        find_local_maxima_kernel<<<numBlocksReduction, BLOCK_SIZE>>>(d_layer, layer_size, d_max_values, d_max_positions, num_candidates);
+        find_local_maxima_kernel<<<numBlocksReduction, block_size>>>(d_layer, layer_size, d_max_values, d_max_positions, num_candidates);
         
         struct timeval t_start, t_end;
         gettimeofday(&t_start, NULL);
@@ -137,8 +135,8 @@ void core(int layer_size, int num_storms, Storm *storms, float *maximum, int *po
         int remaining = num_candidates;
         while (remaining > 1) {
             int half = (remaining + 1) / 2; 
-            int reductionBlocks = (half + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            reduce_max_kernel<<<reductionBlocks, BLOCK_SIZE>>>(d_max_values, d_max_positions, remaining);
+            int reductionBlocks = (half + block_size - 1) / block_size;
+            reduce_max_kernel<<<reductionBlocks, block_size>>>(d_max_values, d_max_positions, remaining);
             cudaDeviceSynchronize();
             remaining = half;
         }
